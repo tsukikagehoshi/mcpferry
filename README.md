@@ -4,83 +4,7 @@
 
 ---
 
-## 一、v2 改用了 Roche 的 `chat` 扩展点
-
-我之前跟你说过两次「Roche 做不到发送前注入」。**那是错的**，v2 就是修正这个。
-
-错在哪：我照着文档那份 API 表推的，而 bundle 用了 **RC4+Base64 字符串混淆**——`"RochePlugin"`、`"promptOnly"` 这些字面量在文件里都不是明文，**直接搜关键词一律零命中**，正好"印证"了错误结论。必须重建解码器才看得见。
-
-`register()` 接受一个**文档没写的 `chat` 字段**，宿主每轮发请求前都会调用。以下每条都从解码后的源码逐字核对过：
-
-```js
-// 注册时收下
-W?.["chat"] && typeof W["chat"]==="object" && uR["set"](c,{pluginId:c,pluginName:k,extension:W["chat"]})
-
-// 每轮发请求前消费
-s["promptOnly"]                    // 静态字符串
-await s["preflight"](ctx)          // 异步回调
-await s["contextProvider"](ctx)    // 异步回调
-s["tools"][].execute               // 工具声明 + 执行
-
-// 注入
-XW && (jo += "\n\n" + XW)          // 追加到主 system prompt 最末尾
-
-// 工具协议
-<roche-plugin-call>{"tool":"<pluginId>:<toolId>","arguments":{}}</roche-plugin-call>
-```
-
-### 带来的实际变化
-
-| | v1 | v2 |
-|---|---|---|
-| 记忆模式 | 预取，**下一轮**才生效 | **真·发送前注入，当轮生效** |
-| 工具调用 | 自己发明的 `[tool:x:{}]` 标记法 | 宿主原生工具协议 |
-| 提示词 | 要手动粘进角色人设 | **不需要了**，自动声明 |
-| 触发方式 | 4 秒轮询监控会话 | 宿主主动调用，**无轮询** |
-| 执行范围 | 自己判断角色 id | 宿主原生 scope + 每服务独立范围 |
-| 写数据库 | 直写 IndexedDB | **完全不写** |
-
-**注入位置在主 system prompt 最末尾**，排在人设、记忆、世界书之后——权重最高的位置。宿主对长度**没有限制**（代码里只有 `trim()`），我自己加了 6000 字上限防止吃爆 token。
-
----
-
-## 二、完全不写数据库
-
-v1 有个「储存原文对话」直接写 `Roche_db` 的 `messages` 表。v2 **删掉了**，因为源码显示那条路有三个坑：
-
-1. **UI 不会更新** —— 渲染读的是内存里的 Vue 响应式数组不是 DB，而且加载器有短路逻辑，**重进会话都不一定重新拉**
-2. **云同步会覆盖** —— `getMessagesPaged` 优先读云端，云端有数据就完全不碰本地，你写的行可能永远读不到甚至被抹掉
-3. **字段写错消息会消失** —— `avatar` 类字段会被剥掉，`visible:false`/`source:"sms"`/`associatedRecordId` 都会触发渲染过滤器
-
-坑 1、3 能修，**坑 2 在插件层根治不了**。走 `chat.tools` 后结果直接进 prompt，**三个坑全都不存在**。
-
-代价：工具结果不作为消息留在聊天记录里。模型看得到、会据此回答，但你翻记录看不到那条。
-
-> 云同步是 **Roche 自带功能**，不是插件带来的。想确认自己开没开，F12 控制台跑：
-> `localStorage.getItem('roche_cloud_sync_config')`
-> 返回 `null` 就是没开。
-
----
-
-## 三、跨域仍需解决
-
-三个病根，前两个插件侧已修好，第三个必须动服务器：
-
-| 测试 | 结果 |
-|---|---|
-| 旧插件的请求（只有 `Content-Type` + `Authorization`） | **406** — `Client must accept both application/json and text/event-stream` |
-| 只加 `Accept: application/json, text/event-stream` | **200 OK** |
-| 浏览器跨域必发的 `OPTIONS` 预检（不带 Authorization） | **401** ← 被 Caddy 暗号锁挡掉 |
-
-你选了**首尔服务器自己跑代理**。文件在 `proxy/`，部署步骤见 `proxy/部署命令.md`。
-
-要点：端口 18020，`ALLOWED_HOSTS` 填主域名即可（代码做了 `endswith(".主域名")` 匹配，5 个子域名全覆盖），Caddy 加个 `ferry.` 子域名**不用加暗号锁**（它只是转发器，真正的保护是各 MCP 自己的暗号）。
-
-**这样你一个 MCP 的 Caddy 配置都不用改。**
-
----
-
-## 四、安装
+## 安装
 
 ### 传 GitHub
 
@@ -96,7 +20,7 @@ mcp2/
 ### Roche 里填
 
 ```
-https://raw.githubusercontent.com/laliandyunhe/mcp2/main/ferry/manifest.json
+https://raw.githubusercontent.com/你的GitHub用户名/你的仓库名/main/ferry/manifest.json
 ```
 
 不要填 `github.com/.../blob/...` 页面链接。
@@ -105,14 +29,14 @@ https://raw.githubusercontent.com/laliandyunhe/mcp2/main/ferry/manifest.json
 
 ---
 
-## 五、怎么填
+## 怎么填
 
 ### 基础页
 
 | 字段 | 填什么 |
 |---|---|
 | 名称 | 随便起，**会显示给模型看**（作为工具描述前缀） |
-| 服务 URL | 要带完整路径，如 `https://video.tsukikagenuojijirelay.online/mcp` |
+| 服务 URL | 要带完整路径，如 `https://xxx.xxxxxxx.xxx/mcp` |
 | 传输类型 | 先试 Streamable HTTP，连不上再切 SSE |
 | 身份验证 | **无** / **Bearer** / **Header** 三选一 |
 
@@ -137,19 +61,10 @@ Bearer 模式**只填 token 本身，不带 `Bearer ` 前缀**，插件自动拼
 
 **执行范围**：全部会话 / 指定范围（按会话类型 + 具体会话）
 
-### 你的服务器速查
-
-| 名称 | 服务 URL | 暗号 |
-|---|---|---|
-| 设备日志 | `https://device.tsukikagenuojijirelay.online/mcp` | 见清单 |
-| 网易云音乐 | `https://netease.tsukikagenuojijirelay.online/mcp` | 见清单 |
-| 掌心窗 | `https://linjian.tsukikagenuojijirelay.online/mcp` | `LINJIAN_TOKEN` |
-| 钓鱼 | `https://fishing.tsukikagenuojijirelay.online/mcp-http` ⚠️路径特殊 | `a80f1d2c5037e187af159029` |
-| 视频识别 | `https://video.tsukikagenuojijirelay.online/mcp` | `cf9e9512e3b09641b64c716f` |
 
 ---
 
-## 六、状态页
+## 状态页
 
 新增的。因为 `chat` 是未文档化的，**万一你某个 Roche 版本不支持，插件会静默不工作**——状态页就是用来发现这件事的。
 
@@ -199,7 +114,7 @@ SSE 流式             ✅  text/event-stream + chunked，没被缓冲
 
 ---
 
-## 八、装多个插件会互相影响吗
+## 装多个插件会互相影响吗
 
 不会。宿主按 `pluginId` 独立注册，注入时遍历所有插件，各自用 `【插件：名字】` 分块。
 
@@ -209,7 +124,7 @@ SSE 流式             ✅  text/event-stream + chunked，没被缓冲
 
 ---
 
-## 九、风险提示
+## 风险提示
 
 - **插件是全信任 JS**，`new Function()` 在主页面 realm 里跑，无 iframe、无沙箱。装之前自己过一遍代码
 - **`chat` 扩展点未文档化**。你说 Roche 已完结，所以改动风险基本没有；状态页可以确认它在不在工作
@@ -217,4 +132,3 @@ SSE 流式             ✅  text/event-stream + chunked，没被缓冲
 - **发送前注入是阻塞的** —— 记忆模式会等 MCP 返回才发消息。「工具调用超时」设太大会让你的消息迟迟发不出去
 - **暗号明文存在插件私有 storage**，同浏览器上其它全信任插件理论上读得到
 - 用代理时**暗号会经过代理**（是你自己的机器）
-- ⚠️ 你之前在对话里明文贴过 Gemini key，记得去 aistudio.google.com/apikey 重置，改完 `video.env` 后 `docker restart video`
